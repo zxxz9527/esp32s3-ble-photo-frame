@@ -1,0 +1,509 @@
+/*
+  ============================================================
+   ESP32-S3 蓝牙图片显示器 (BLE Photo Display)  -  PlatformIO
+  ------------------------------------------------------------
+   电脑 (Edge/Chrome) 打开工程外 tools/photo_uploader.html
+   -> 蓝牙连接本设备 -> 选择 JPG 上传 -> 屏幕立即显示
+   -> 图片保存在 LittleFS，断电重启后自动恢复
+
+   说明: ESP32-S3 仅支持 BLE 低功耗蓝牙 (不支持经典蓝牙)，
+         电脑需要有蓝牙功能 (Win10/11 自带，无需装驱动)。
+
+   硬件: ESP32-S3 + 1.8寸 128x160 SPI TFT 彩屏 (ST7735S)
+         横屏使用，分辨率 160x128
+
+   接线 (可在下方"用户配置区"修改引脚):
+     屏幕引脚        ESP32-S3
+     VCC / VDD   ->  3.3V
+     GND         ->  GND
+     SCL/SCK/CLK ->  GPIO12
+     SDA/MOSI    ->  GPIO11   (MISO/SDO 不需要接)
+     DC/RS/A0    ->  GPIO9
+     CS          ->  GPIO10
+     RST/RES     ->  GPIO8
+     BL/LED/BLK  ->  GPIO7 (或直接接 3.3V 常亮，PIN_BL 改 -1)
+  ============================================================
+*/
+
+#include <Arduino.h>
+#include <LittleFS.h>
+// BLE (Bluedroid，arduino-esp32 框架自带，无需额外安装库)
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+// 显示
+#include <LovyanGFX.hpp>
+
+// ==================== 用户配置区 ====================
+// 蓝牙广播名称 (电脑上看到的设备名)
+#define BLE_DEVICE_NAME "ESP32S3-Photo"
+
+// 屏幕驱动型号
+//    1 = ST7735S  -> 1.8寸 128x160 屏 【默认】
+//    2 = ST7789   -> 2.0/2.4寸 240x320 屏
+//    3 = ILI9341  -> 2.4寸 240x320 屏
+#define PANEL_TYPE 1
+
+// 引脚接线 (按实际接线修改)
+#define PIN_SCLK  12
+#define PIN_MOSI  11
+#define PIN_DC     9
+#define PIN_CS    10
+#define PIN_RST    8
+#define PIN_BL     7     // 背光若直接接 3.3V，这里改为 -1
+// ===================================================
+
+#define IMG_PATH        "/img.jpg"   // 持久保存的当前图片 (断电保留)
+#define TMP_PATH        "/tmp.jpg"   // 上传时的临时文件
+#define MAX_UPLOAD_BYTES (1500UL * 1024UL)  // 上传大小限制 1.5MB
+
+// BLE GATT UUID (与 tools/photo_uploader.html 中保持一致)
+#define SVC_UUID "8f750001-2c3a-4f9b-8e21-6b5d7c9e0a01"  // 服务
+#define RX_UUID  "8f750002-2c3a-4f9b-8e21-6b5d7c9e0a01"  // 电脑->设备 (写)
+#define TX_UUID  "8f750003-2c3a-4f9b-8e21-6b5d7c9e0a01"  // 设备->电脑 (通知)
+
+// ---------------- 屏幕驱动定义 ----------------
+class Display : public lgfx::LGFX_Device {
+#if PANEL_TYPE == 1
+  lgfx::Panel_ST7735S _panel;
+#elif PANEL_TYPE == 3
+  lgfx::Panel_ILI9341 _panel;
+#else
+  lgfx::Panel_ST7789  _panel;
+#endif
+  lgfx::Bus_SPI       _bus;
+  lgfx::Light_PWM     _light;
+
+public:
+  Display(void) {
+    {  // SPI 总线
+      auto cfg = _bus.config();
+      cfg.spi_host   = SPI2_HOST;
+      cfg.spi_mode   = 0;
+#if PANEL_TYPE == 1
+      cfg.freq_write = 27000000;   // ST7735 建议 ≤27MHz
+#else
+      cfg.freq_write = 40000000;
+#endif
+      cfg.freq_read  = 16000000;
+      cfg.spi_3wire  = true;
+      cfg.use_lock   = true;
+      cfg.pin_sclk = PIN_SCLK;
+      cfg.pin_mosi = PIN_MOSI;
+      cfg.pin_miso = -1;
+      cfg.pin_dc   = PIN_DC;
+      _bus.config(cfg);
+    }
+    {  // 面板
+      auto cfg = _panel.config();
+      cfg.pin_cs   = PIN_CS;
+      cfg.pin_rst  = PIN_RST;
+      cfg.pin_busy = -1;
+#if PANEL_TYPE == 1
+      // ST7735S 1.8寸 128x160：本模块物理像素从显存第0行列开始，
+      // 故显存直接设为 128x160、偏移归零(与可见区完全重合，无越界扫描)。
+      cfg.panel_width   = 128;
+      cfg.panel_height  = 160;
+      cfg.memory_width  = 128;
+      cfg.memory_height = 160;
+      cfg.offset_x       = 0;
+      cfg.offset_y       = 0;
+      // 若出现边缘花屏/错位，说明你的批次显存是 132x162 且带偏移，改回:
+      //   memory_width=132; memory_height=162; 并试 offset (0,0)/(2,0)/(0,2)/(2,2)
+      // 反相显示: 若颜色像照片底片(反色)则改为 true
+      cfg.invert     = false;
+#else
+      cfg.panel_width   = 240;
+      cfg.panel_height  = 320;
+      cfg.memory_width  = 240;
+      cfg.memory_height = 320;
+      cfg.offset_x       = 0;
+      cfg.offset_y       = 0;
+      cfg.invert     = false;   // 若颜色像照片底片(反相)，改为 true
+#endif
+      cfg.offset_rotation = 0;
+      cfg.dummy_read_bits = 1;
+      cfg.readable   = false;
+      cfg.rgb_order  = true;    // 红蓝颜色互换(红显蓝/蓝显红)时设为 true
+      cfg.dlen_16bit = false;
+      cfg.bus_shared = false;
+      _panel.config(cfg);
+      _panel.setBus(&_bus);
+#if PIN_BL >= 0
+      _panel.setLight(&_light);
+#endif
+    }
+#if PIN_BL >= 0
+    {  // 背光 PWM
+      auto cfg = _light.config();
+      cfg.pin_bl      = PIN_BL;
+      cfg.freq        = 12000;
+      cfg.pwm_channel = 7;
+      _light.config(cfg);
+    }
+#endif
+    setPanel(&_panel);
+  }
+};
+
+static Display tft;
+
+// ---------------- 传输状态 ----------------
+// 重要: BLE 写回调运行在 Bluedroid 的 BTC_TASK 上，该任务栈很小(约3KB)，
+//       不能在回调里做 LittleFS 文件操作(会栈溢出重启)。
+//       因此回调只把数据 memcpy 进环形缓冲，写盘由 loop() 主循环完成。
+#define RING_SIZE (16 * 1024)
+static uint8_t  s_ring[RING_SIZE];
+static volatile uint32_t s_ringHead = 0;   // 回调(生产者)写入位置
+static volatile uint32_t s_ringTail = 0;   // loop(消费者)读取位置
+
+static BLECharacteristic* s_pTx = nullptr;
+static volatile bool s_bleConnected  = false;
+static volatile bool s_sessionActive = false;  // 一次上传会话进行中
+static volatile bool s_startRequested = false;
+static volatile bool s_finishRequested = false;
+static volatile bool s_clearRequested  = false;
+static volatile uint32_t s_startTotal = 0;
+
+// 以下仅在 loop() 主循环中访问
+static File     s_upFile;
+static bool     s_streamOpen = false;
+static uint32_t s_recvTotal = 0;
+static uint32_t s_recvBytes = 0;
+
+// 生产者: BLE 回调把数据放入环形缓冲 (满了就等 loop 消费，BLE 有每包ACK流控)
+static void ringPush(const uint8_t* data, uint32_t len) {
+  uint32_t head = s_ringHead;
+  for (uint32_t i = 0; i < len; i++) {
+    uint32_t next = (head + 1 == RING_SIZE) ? 0 : head + 1;
+    while (next == s_ringTail) { /* 缓冲满，等待主循环写盘腾出空间 */ }
+    s_ring[head] = data[i];
+    head = next;
+  }
+  s_ringHead = head;
+}
+
+enum UiState { UI_BOOT, UI_CONNECTED, UI_RECEIVING, UI_IMAGE, UI_ERROR };
+static UiState s_uiState = UI_BOOT;
+static bool    s_uiDrawn = false;
+static uint8_t s_pctDrawn = 255;
+
+// ---------------- 通知给电脑 ----------------
+static void notifyStr(const char* s) {
+  if (s_pTx && s_bleConnected) {
+    s_pTx->setValue(s);
+    s_pTx->notify();
+  }
+}
+
+// ---------------- 屏幕界面 (横屏 160x128) ----------------
+static void centerText(const char* s, int y, const lgfx::IFont* font, uint32_t color) {
+  tft.setTextColor(color, TFT_BLACK);
+  tft.setTextDatum(middle_center);
+  tft.setFont(font);
+  tft.drawString(s, tft.width() / 2, y);
+}
+
+static void drawBoot() {
+  tft.fillScreen(TFT_BLACK);
+  centerText("ESP32-S3",      24, &fonts::Font2, TFT_WHITE);
+  centerText("Photo Display", 54, &fonts::Font0, TFT_CYAN);
+  centerText("BLE Ready",     82, &fonts::Font0, TFT_GREEN);
+  centerText(BLE_DEVICE_NAME, 110, &fonts::Font0, TFT_YELLOW);
+}
+
+static void drawConnected() {
+  tft.fillScreen(TFT_BLACK);
+  centerText("ESP32-S3",      26, &fonts::Font2, TFT_WHITE);
+  centerText("BLE Connected", 60, &fonts::Font0, TFT_GREEN);
+  centerText("Open web page", 90, &fonts::Font0, TFT_CYAN);
+  centerText("pick a JPG",   110, &fonts::Font0, TFT_CYAN);
+}
+
+static void drawReceiving(int pct) {
+  if (pct == 0) {  // 首次绘制背景
+    tft.fillScreen(TFT_BLACK);
+    centerText("Receiving...", 32, &fonts::Font0, TFT_CYAN);
+    tft.drawRect(14, 52, 132, 22, TFT_WHITE);
+  }
+  int w = 128 * pct / 100;
+  if (w > 0) tft.fillRect(16, 54, w, 18, 0x3B82F6);
+  char line[16];
+  snprintf(line, sizeof(line), "%d%%", pct);
+  tft.fillRect(60, 86, 40, 18, TFT_BLACK);
+  centerText(line, 95, &fonts::Font0, TFT_WHITE);
+}
+
+static void drawDecodeError() {
+  tft.fillScreen(TFT_BLACK);
+  centerText("JPEG failed!",  54, &fonts::Font0, TFT_RED);
+  centerText("Use baseline JPG", 86, &fonts::Font0, TFT_YELLOW);
+}
+
+// 显示 LittleFS 中指定路径的 JPG：自动等比缩放 + 居中
+static bool displayJpeg(const char* path) {
+  tft.fillScreen(TFT_BLACK);
+  bool ok = tft.drawJpgFile(LittleFS, path,
+                            0, 0,
+                            tft.width(), tft.height(),  // 适配区域：整个屏幕
+                            0, 0,
+                            0.0f, 0.0f,                // 0 表示自动等比缩放(contain)
+                            middle_center);            // 居中
+  if (!ok) {
+    Serial.println("[ERR] JPEG decode failed");
+    drawDecodeError();
+  }
+  return ok;
+}
+
+// ---------------- BLE 回调 ----------------
+class PhotoServerCB : public BLEServerCallbacks {
+  void onConnect(BLEServer*) override {
+    s_bleConnected = true;
+    Serial.println("[BLE] client connected");
+    if (s_uiState == UI_BOOT || s_uiState == UI_ERROR) {
+      s_uiState = UI_CONNECTED;
+      s_uiDrawn = false;
+    }
+  }
+  void onDisconnect(BLEServer*) override {
+    // 注意: 本回调在 BTC_TASK 中执行，不能碰文件对象/串口打印，只置标志
+    s_bleConnected  = false;
+    s_sessionActive = false;
+    s_startRequested  = false;
+    s_finishRequested = false;
+    s_clearRequested  = false;
+    s_ringHead = 0;  // 丢弃环形缓冲中未写完的数据
+    s_ringTail = 0;
+    BLEDevice::startAdvertising();
+    if (s_uiState != UI_IMAGE) {
+      s_uiState = UI_BOOT;
+      s_uiDrawn = false;
+    }
+  }
+};
+
+class PhotoRxCB : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic* c) override {
+    // 本回调在 BTC_TASK(栈很小) 中执行：禁止文件操作/串口打印，
+    // 只做最小工作(置标志 + 数据入环形缓冲)，重活全部交给 loop()。
+    size_t len = c->getLength();      // 兼容 Arduino-ESP32 2.x / 3.x
+    const uint8_t* d = c->getData();
+    if (len == 0 || d == nullptr) return;
+
+    switch ((char)d[0]) {
+      case 'S': {  // 开始: 'S' + uint32 LE 总长度
+        if (len < 5) break;
+        uint32_t total = (uint32_t)d[1] | ((uint32_t)d[2] << 8)
+                       | ((uint32_t)d[3] << 16) | ((uint32_t)d[4] << 24);
+        s_ringHead = 0;
+        s_ringTail = 0;
+        s_startTotal = total;
+        s_finishRequested = false;
+        s_sessionActive = true;
+        s_startRequested = true;   // loop 负责校验大小/打开文件
+        break;
+      }
+      case 'D': {  // 数据: 'D' + 数据 -> 入环形缓冲
+        if (s_sessionActive && len > 1) {
+          ringPush(d + 1, (uint32_t)len - 1);
+        }
+        break;
+      }
+      case 'F': {  // 结束
+        if (s_sessionActive) s_finishRequested = true;
+        break;
+      }
+      case 'C': {  // 清空屏幕
+        s_clearRequested = true;
+        break;
+      }
+    }
+  }
+};
+
+// 消费者: 把环形缓冲中的数据写入文件，返回本次写入字节数
+static uint32_t pumpRingToFile() {
+  uint32_t written = 0;
+  uint32_t tail = s_ringTail;
+  uint32_t head = s_ringHead;   // 快照；head 之前的数据都已就绪
+  while (tail != head) {
+    uint32_t seg = (head >= tail) ? (head - tail) : (RING_SIZE - tail);
+    s_upFile.write(s_ring + tail, seg);
+    written += seg;
+    tail += seg;
+    if (tail >= RING_SIZE) tail = 0;
+  }
+  s_ringTail = tail;
+  return written;
+}
+
+// ---------------- setup / loop ----------------
+void setup() {
+  Serial.begin(115200);
+  delay(100);
+  Serial.println("\n=== ESP32-S3 BLE Photo Display (PlatformIO) ===");
+
+  // 屏幕初始化
+  tft.init();
+  tft.setRotation(1);          // 横屏 160x128 (0/2 为竖屏)
+  tft.setBrightness(255);
+  tft.fillScreen(TFT_BLACK);
+
+  // 文件系统 (begin(true): 首次使用自动格式化)
+  bool fsOk = LittleFS.begin(true);
+  if (!fsOk) {
+    Serial.println("[FS] LittleFS mount failed!");
+    centerText("FS Error!", 64, &fonts::Font0, TFT_RED);
+  } else {
+    Serial.printf("[FS] total %u KB, used %u KB\n",
+                  LittleFS.totalBytes() / 1024, LittleFS.usedBytes() / 1024);
+    // 恢复上次显示的图片
+    if (LittleFS.exists(IMG_PATH) && displayJpeg(IMG_PATH)) {
+      s_uiState = UI_IMAGE;
+      s_uiDrawn = true;
+    }
+  }
+
+  // BLE 初始化
+  BLEDevice::init(BLE_DEVICE_NAME);
+  BLEDevice::setMTU(512);   // 协商更大 MTU，提高传图速度
+  BLEServer* srv = BLEDevice::createServer();
+  srv->setCallbacks(new PhotoServerCB());
+
+  BLEService* svc = srv->createService(SVC_UUID);
+
+  s_pTx = svc->createCharacteristic(TX_UUID, BLECharacteristic::PROPERTY_NOTIFY);
+  s_pTx->addDescriptor(new BLE2902());
+
+  BLECharacteristic* pRx = svc->createCharacteristic(
+        RX_UUID, BLECharacteristic::PROPERTY_WRITE
+               | BLECharacteristic::PROPERTY_WRITE_NR);
+  pRx->setCallbacks(new PhotoRxCB());
+
+  svc->start();
+
+  BLEAdvertising* adv = BLEDevice::getAdvertising();
+  adv->addServiceUUID(SVC_UUID);
+  adv->setScanResponse(true);
+  adv->start();
+
+  Serial.printf("[BLE] advertising as \"%s\"\n", BLE_DEVICE_NAME);
+  if (s_uiState != UI_IMAGE) { s_uiState = UI_BOOT; s_uiDrawn = false; }
+}
+
+void loop() {
+  // 断开后清理未完成的写盘 (回调在 BTC 任务中不能碰文件对象)
+  if (!s_bleConnected && s_streamOpen) {
+    if (s_upFile) { s_upFile.flush(); s_upFile.close(); }
+    s_streamOpen = false;
+    s_sessionActive = false;
+    s_startRequested = false;
+    s_finishRequested = false;
+  }
+
+  // 清空请求
+  if (s_clearRequested) {
+    s_clearRequested = false;
+    if (s_bleConnected) { s_uiState = UI_CONNECTED; s_uiDrawn = false; }
+    notifyStr("OK");
+  }
+
+  // 上传开始: 校验大小 + 清理旧文件 + 打开临时文件 (全部在主任务做)
+  if (s_startRequested) {
+    s_startRequested = false;
+    s_recvTotal = s_startTotal;
+    s_recvBytes = 0;
+    s_streamOpen = false;
+    Serial.printf("[BLE] upload start, %u bytes\n", s_recvTotal);
+    if (s_recvTotal == 0 || s_recvTotal > MAX_UPLOAD_BYTES) {
+      s_sessionActive = false;
+      notifyStr("ERR:file too large (max 1.5MB)");
+    } else {
+      // 先清理旧图与临时文件，使峰值 Flash 占用不超过 1.5MB
+      LittleFS.remove(IMG_PATH);
+      LittleFS.remove(TMP_PATH);
+      s_upFile = LittleFS.open(TMP_PATH, "w");
+      if (!s_upFile) {
+        s_sessionActive = false;
+        s_ringHead = 0; s_ringTail = 0;
+        notifyStr("ERR:storage error");
+      } else {
+        s_streamOpen = true;
+        s_uiState = UI_RECEIVING;
+        s_uiDrawn = false;
+        s_pctDrawn = 255;
+      }
+    }
+  }
+
+  // 把环形缓冲中的数据写入 Flash (主任务上下文，栈充足)
+  if (s_streamOpen) {
+    s_recvBytes += pumpRingToFile();
+  }
+
+  // 上传完成: 先排空缓冲，再关文件 -> 解码显示
+  if (s_finishRequested) {
+    if (s_streamOpen) {
+      s_recvBytes += pumpRingToFile();   // 排空最后一段数据
+      if (s_ringTail != s_ringHead) {
+        delay(2);                        // 极端情况下还有数据，下轮继续
+      } else {
+        s_finishRequested = false;
+        s_sessionActive  = false;
+        s_streamOpen     = false;
+        s_upFile.flush();
+        s_upFile.close();
+        Serial.printf("[BLE] upload end, got %u bytes\n", s_recvBytes);
+        if (s_recvBytes == 0) {
+          LittleFS.remove(TMP_PATH);
+          notifyStr("ERR:empty file");
+        } else {
+          bool ok = displayJpeg(TMP_PATH);   // 解码在主任务做，不阻塞 BLE 栈
+          if (ok) {
+            LittleFS.remove(IMG_PATH);
+            LittleFS.rename(TMP_PATH, IMG_PATH);
+            s_uiState = UI_IMAGE;
+            s_uiDrawn = true;
+            Serial.println("[OK] image saved and displayed");
+            notifyStr("OK");
+          } else {
+            LittleFS.remove(TMP_PATH);
+            s_uiState = s_bleConnected ? UI_ERROR : UI_BOOT;
+            s_uiDrawn = false;
+            notifyStr("ERR:JPEG decode failed, use baseline JPG");
+          }
+        }
+      }
+    } else {
+      s_finishRequested = false;  // 文件未成功打开过
+      s_sessionActive  = false;
+    }
+  }
+
+  // 界面刷新
+  switch (s_uiState) {
+    case UI_BOOT:
+    case UI_CONNECTED:
+    case UI_ERROR:
+      if (!s_uiDrawn) {
+        if (s_uiState == UI_BOOT)           drawBoot();
+        else if (s_uiState == UI_CONNECTED) drawConnected();
+        else                                drawDecodeError();
+        s_uiDrawn = true;
+      }
+      break;
+    case UI_RECEIVING: {
+      uint8_t pct = s_recvTotal ? (uint8_t)(s_recvBytes * 100 / s_recvTotal) : 0;
+      if (pct > 100) pct = 100;
+      if (!s_uiDrawn) { drawReceiving(0); s_uiDrawn = true; s_pctDrawn = 0; }
+      if (pct != s_pctDrawn) { drawReceiving(pct); s_pctDrawn = pct; }
+      break;
+    }
+    default:  // UI_IMAGE: 图片已在屏幕上，不做刷新
+      break;
+  }
+
+  delay(5);
+}

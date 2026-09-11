@@ -1,0 +1,18 @@
+# ---- PlatformIO 构建产物与缓存（含 272MB .pio，切勿入库）----
+image_display/.pio/
+image_display/.cache/
+image_display/compile_commands.json
+
+# ---- LittleFS 运行时数据（设备端生成的图片，不入库）----
+image_display/data/
+
+# ---- 编辑器 ----
+# 仅忽略根目录 .vscode（内含与本工程无关的遗留 arduino.yaml）
+# 工程内的 image_display/.vscode/extensions.json 需要入库
+/.vscode/
+*.code-workspace
+
+# ---- 系统 ----
+Thumbs.db
+Desktop.ini
+.DS_Store

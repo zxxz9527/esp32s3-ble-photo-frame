@@ -1,0 +1,397 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ESP32-S3 蓝牙图片显示器</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{min-height:100vh;display:flex;align-items:center;justify-content:center;
+    background:linear-gradient(135deg,#1e2a4a 0%,#0f1626 60%,#0a0f1c 100%);
+    font-family:"Microsoft YaHei","PingFang SC",system-ui,sans-serif;color:#e8eefc;padding:20px}
+  .card{width:100%;max-width:520px;background:rgba(255,255,255,.06);
+    border:1px solid rgba(255,255,255,.12);border-radius:20px;padding:28px;
+    box-shadow:0 20px 60px rgba(0,0,0,.45);backdrop-filter:blur(8px)}
+  h1{font-size:22px;text-align:center;margin-bottom:14px}
+  .status{display:flex;align-items:center;justify-content:center;gap:8px;font-size:14px;margin-bottom:18px;color:#b9c6e0}
+  .dot{width:10px;height:10px;border-radius:50%;background:#66708c;flex:none}
+  .dot.on{background:#58e6a8;box-shadow:0 0 8px #58e6a8}
+  .dot.busy{background:#f5a623;box-shadow:0 0 8px #f5a623}
+  #conn{width:100%;padding:12px 0;font-size:15px;border:none;border-radius:12px;cursor:pointer;
+    background:linear-gradient(135deg,#8b5cf6,#6d28d9);color:#fff;font-weight:600;margin-bottom:18px}
+  #drop{display:block;border:2px dashed rgba(255,255,255,.28);border-radius:14px;
+    padding:22px;text-align:center;cursor:pointer;transition:.2s;overflow:hidden}
+  #drop:hover,#drop.over{border-color:#58a6ff;background:rgba(88,166,255,.08)}
+  #hint{font-size:15px;color:#b9c6e0}
+  #preview{display:none;max-width:100%;max-height:220px;border-radius:10px;margin:10px auto 0}
+  .row{display:flex;gap:12px;margin-top:18px}
+  button.act{flex:1;padding:13px 0;font-size:16px;border:none;border-radius:12px;cursor:pointer;
+    background:linear-gradient(135deg,#3b82f6,#2563eb);color:#fff;font-weight:600;transition:.2s}
+  button.ghost{flex:1;padding:13px 0;font-size:15px;border-radius:12px;cursor:pointer;
+    background:transparent;border:1px solid rgba(255,255,255,.3);color:#cfd9ee}
+  button:disabled{opacity:.4;cursor:not-allowed}
+  .progress{margin-top:16px;height:8px;border-radius:6px;background:rgba(255,255,255,.1);overflow:hidden;display:none}
+  #bar{height:100%;width:0;background:linear-gradient(90deg,#58e6a8,#3b82f6);transition:width .15s}
+  #msg{margin-top:14px;text-align:center;font-size:14px;min-height:20px}
+  #msg.ok{color:#58e6a8}#msg.err{color:#ff7b7b}
+  .tips{margin-top:18px;list-style:none;font-size:12.5px;color:#8fa0c0;line-height:1.9}
+  .tips li::before{content:"· ";color:#58a6ff}
+  /* ---- 裁剪器 ---- */
+  .cropper{display:none;margin-top:16px;border-top:1px solid rgba(255,255,255,.12);padding-top:16px}
+  .cropper.on{display:block}
+  .crop-head{font-size:14px;color:#b9c6e0;margin-bottom:8px;text-align:center}
+  .crop-view{position:relative;width:100%;aspect-ratio:5/3;border-radius:10px;overflow:hidden;
+    background:#000;touch-action:none;cursor:grab;border:1px solid rgba(255,255,255,.25)}
+  .crop-view:active{cursor:grabbing}
+  #cropImg{position:absolute;left:0;top:0;max-width:none;pointer-events:none;
+    -webkit-user-drag:none;user-select:none}
+  .crop-grid{position:absolute;inset:0;pointer-events:none}
+  .crop-grid::before,.crop-grid::after{content:"";position:absolute;background:rgba(255,255,255,.35)}
+  .crop-grid::before{left:33.33%;right:33.33%;top:0;bottom:0;border-left:1px solid rgba(255,255,255,.35);
+    border-right:1px solid rgba(255,255,255,.35);background:transparent}
+  .crop-grid::after{top:33.33%;bottom:33.33%;left:0;right:0;border-top:1px solid rgba(255,255,255,.35);
+    border-bottom:1px solid rgba(255,255,255,.35);background:transparent}
+  .crop-tip{font-size:12px;color:#8fa0c0;text-align:center;margin:8px 0 2px}
+  #cropZoom{width:100%;margin:10px 0 4px;accent-color:#6d28d9}
+  .crop-row{display:flex;gap:10px;margin-top:10px}
+  .crop-row button{flex:1;padding:11px 0;font-size:14px;border-radius:12px;cursor:pointer;font-weight:600;white-space:nowrap}
+  .crop-row .ok{border:none;background:linear-gradient(135deg,#10b981,#059669);color:#fff}
+  .crop-row .rs{background:transparent;border:1px solid rgba(255,255,255,.3);color:#cfd9ee}
+</style>
+<!-- HEIC/HEIF (iPhone 默认格式) 浏览器无法原生解码，用本地 heic2any 先转 JPEG -->
+<script src="heic2any.min.js"></script>
+</head>
+<body>
+<div class="card">
+  <h1>ESP32-S3 蓝牙图片显示器</h1>
+  <div class="status"><span class="dot" id="dot"></span><span id="connText">未连接蓝牙</span></div>
+  <button id="conn">1. 连接 ESP32-S3</button>
+  <label id="drop" for="file">
+    <input type="file" id="file" accept="image/*,.jpg,.jpeg,.png,.webp,.bmp,.gif,.avif,.heic,.heif" hidden>
+    <div id="hint">点击选择，或把图片拖拽到这里（自动转 JPG）</div>
+    <img id="preview" alt="预览">
+  </label>
+  <div class="row">
+    <button class="act" id="btnUpload" disabled>2. 上传并显示</button>
+    <button class="ghost" id="btnClear" disabled>清空屏幕</button>
+  </div>
+  <div class="progress" id="prog"><div id="bar"></div></div>
+  <p id="msg"></p>
+
+  <!-- 裁剪器：选图后框选 400x240 (5:3) 区域 -->
+  <div class="cropper" id="cropper">
+    <div class="crop-head">裁剪图片（框选区域即屏幕显示范围 400×240）</div>
+    <div class="crop-view" id="cropView">
+      <img id="cropImg" alt="">
+      <div class="crop-grid"></div>
+    </div>
+    <div class="crop-tip">拖动平移 · 双指捏合或下方滑块缩放 · 可旋转图片</div>
+    <input type="range" id="cropZoom" min="1" max="4" step="0.01" value="1">
+    <div class="crop-row">
+      <button class="rs" id="cropCancel">取消</button>
+      <button class="rs" id="cropRotate">⟳ 旋转</button>
+      <button class="rs" id="cropReset">重置</button>
+      <button class="ok" id="cropOk">确定裁剪</button>
+    </div>
+  </div>
+
+  <ul class="tips">
+    <li>请用 Edge / Chrome 浏览器打开本页面，并打开电脑/手机蓝牙</li>
+    <li>选图后可拖动框选构图、点「⟳ 旋转」调整方向，确定时自动裁剪为 400×240</li>
+    <li>JPG/PNG/WebP/BMP/iPhone HEIC 均可，确定后自动转换为标准 baseline JPG 上传</li>
+    <li>iPhone 若提示无法转换 HEIC：在「设置→相机→格式」中选择「兼容性最好」</li>
+    <li>传输时设备与电脑/手机保持在蓝牙范围内（约 10 米）</li>
+  </ul>
+</div>
+<script>
+const $=s=>document.querySelector(s);
+// 与固件中的 UUID 保持一致
+const SVC='8f750001-2c3a-4f9b-8e21-6b5d7c9e0a01';
+const RX ='8f750002-2c3a-4f9b-8e21-6b5d7c9e0a01'; // 电脑 -> 设备 (write)
+const TX ='8f750003-2c3a-4f9b-8e21-6b5d7c9e0a01'; // 设备 -> 电脑 (notify)
+const CHUNK=176; // 每包数据字节数 (整包 177 字节，兼容 MTU 协商)
+let gatt=null, rxCh=null, txCh=null, file=null, busy=false;
+let waiters=[];
+
+function setStatus(t,c){const m=$('#msg');m.className=c||'';m.textContent=t;}
+function setConn(connected,txt,busy){
+  $('#dot').className='dot'+(busy?' busy':connected?' on':'');
+  $('#connText').textContent=txt;
+  $('#conn').disabled=connected||busy;
+  $('#btnClear').disabled=!connected||busy;
+}
+function onDeviceMsg(msg){
+  const w=waiters.shift();
+  if(w) w(msg);
+}
+function waitDeviceMsg(ms){
+  return new Promise((res,rej)=>{
+    const t=setTimeout(()=>{waiters=waiters.filter(x=>x!==r);rej(new Error('等待设备响应超时'));},ms);
+    function r(m){clearTimeout(t);res(m);}
+    waiters.push(r);
+  });
+}
+async function writePkt(buf){ await rxCh.writeValueWithResponse(buf); }
+
+$('#conn').addEventListener('click',async()=>{
+  if(!navigator.bluetooth){setStatus('当前浏览器不支持 Web Bluetooth，请换用 Edge/Chrome','err');return;}
+  try{
+    setConn(false,'正在扫描设备…',true);
+    const dev=await navigator.bluetooth.requestDevice({filters:[{services:[SVC]}]});
+    dev.addEventListener('gattserverdisconnected',()=>{gatt=null;setConn(false,'蓝牙已断开，请重新连接',false);});
+    gatt=await dev.gatt.connect();
+    const svc=await gatt.getPrimaryService(SVC);
+    txCh=await svc.getCharacteristic(TX);
+    rxCh=await svc.getCharacteristic(RX);
+    await txCh.startNotifications();
+    txCh.addEventListener('characteristicvaluechanged',e=>onDeviceMsg(new TextDecoder().decode(e.target.value)));
+    setConn(true,'已连接：'+(dev.name||'ESP32-S3'),false);
+    setStatus('连接成功，选择图片后点上传','ok');
+  }catch(e){
+    setConn(false,'未连接蓝牙',false);
+    if(e&&e.name==='NotFoundError') setStatus('已取消选择设备','');
+    else setStatus('连接失败：'+e.message,'err');
+  }
+});
+
+function showPreview(){
+  if(!file)return;
+  setStatus('已裁剪为 400×240，可点上传','ok');
+  $('#preview').src=URL.createObjectURL(file);
+  $('#preview').style.display='block';
+  $('#hint').textContent=file.name+'  ('+(file.size/1024).toFixed(1)+' KB，400×240)';
+  $('#btnUpload').disabled=!gatt||busy;
+}
+$('#file').addEventListener('change',e=>{file=e.target.files[0]||null;if(file)openCropper(file);});
+const drop=$('#drop');
+['dragenter','dragover'].forEach(ev=>drop.addEventListener(ev,e=>{e.preventDefault();drop.classList.add('over');}));
+['dragleave','drop'].forEach(ev=>drop.addEventListener(ev,e=>{e.preventDefault();drop.classList.remove('over');}));
+drop.addEventListener('drop',e=>{file=e.dataTransfer.files[0]||null;
+  if(file){openCropper(file);} });
+
+// ---------------- 裁剪器 ----------------
+// 模型: 裁剪视口固定 5:3 (即屏幕 400x240 横屏)；图片在视口内平移/缩放，
+//       且始终铺满视口(不留黑边)。导出时把视口可见区域映射回原图像素。
+const cropper=$('#cropper'),cropView=$('#cropView'),cropImg=$('#cropImg'),cropZoom=$('#cropZoom');
+let rawFile=null;
+let workCanvas=null;    // 当前编辑位图(已含旋转)，裁剪/旋转/导出都以它为准
+let cNW=0,cNH=0;        // 当前位图自然尺寸(px，旋转后宽高交换)
+let cVW=0,cVH=0;        // 视口 CSS 尺寸(px)
+let cBase=1;            // "刚好铺满视口"时的显示比例 (CSS px / 自然 px)
+let cScale=1;           // 用户缩放倍数(相对 cBase)，范围 1~4
+let cX=0,cY=0;          // 图片左上角相对视口的 CSS 坐标(<=0)
+const pointers=new Map();
+let pinchD=0;
+
+function clampCrop(){
+  // 唯一约束入口: 图片必须覆盖整个视口
+  const dw=cNW*cBase*cScale, dh=cNH*cBase*cScale;
+  cX=Math.min(0,Math.max(cX,cVW-dw));
+  cY=Math.min(0,Math.max(cY,cVH-dh));
+  cropImg.style.width=dw+'px';
+  cropImg.style.height=dh+'px';
+  cropImg.style.left=cX+'px';
+  cropImg.style.top=cY+'px';
+}
+function applyCrop(z,x,y){cScale=z;cX=x;cY=y;clampCrop();cropZoom.value=z;}
+// 以视口内点(ax,ay)为锚点缩放(锚点对应的图像内容保持不动)
+function zoomAt(z,ax,ay){
+  z=Math.min(4,Math.max(1,z));
+  const s0=cBase*cScale, s1=cBase*z;
+  const ix=(ax-cX)/s0, iy=(ay-cY)/s0;
+  applyCrop(z, ax-ix*s1, ay-iy*s1);
+}
+function openCropper(f){
+  rawFile=f;
+  setStatus('正在加载图片…','');
+  cropImg.onload=null; cropImg.onerror=null;
+  loadBitmap(f).then(bmp=>{
+    buildWorkCanvas(bmp);
+    bmp.close();
+    syncWorkToCrop();
+  }).catch(err=>{
+    setStatus(err&&err.message||'图片无法解码，请换一张图片','err');
+    rawFile=null;file=null;
+  });
+}
+// 判断是否 iPhone 的 HEIC/HEIF 格式
+function isHeic(f){
+  const t=(f.type||'').toLowerCase();
+  if(t.includes('heic')||t.includes('heif'))return true;
+  return /\.(heic|heif)$/i.test(f.name||'');
+}
+// 统一加载为 ImageBitmap：HEIC 先转 JPEG；应用 EXIF 方向
+async function loadBitmap(f){
+  let blob=f;
+  if(isHeic(f)){
+    if(typeof heic2any==='undefined'){
+      throw new Error('HEIC 转换组件未加载（请确认 heic2any.min.js 与本页面在同一文件夹）。也可在手机「设置→相机→格式」选「兼容性最好」后重存为 JPG');
+    }
+    setStatus('正在转换 HEIC 照片…','');
+    try{
+      const out=await heic2any({blob:f, toType:'image/jpeg', quality:0.92});
+      blob=Array.isArray(out)?out[0]:out;
+    }catch(e){
+      throw new Error('HEIC 转换失败，请把照片另存为 JPG 后再试');
+    }
+  }
+  // imageOrientation:'from-image' 应用手机照片的 EXIF 方向；
+  // 老浏览器不认识该选项会按字典规则忽略，安全回退。
+  try{ return await createImageBitmap(blob,{imageOrientation:'from-image'}); }
+  catch(e){ return await createImageBitmap(blob); }
+}
+// 由 bitmap 构建工作画布；手机照片可能高达 8000×6000，
+// 超过 canvas 面积上限会黑屏/toBlob 失败，且屏幕只需 400×240，
+// 这里把最大边限制到 4096（缩小对最终画质无可见影响）。
+function buildWorkCanvas(bmp){
+  const MAXDIM=4096;
+  let w=bmp.width, h=bmp.height;
+  const m=Math.max(w,h);
+  if(m>MAXDIM){ const k=MAXDIM/m; w=Math.round(w*k); h=Math.round(h*k); }
+  workCanvas=document.createElement('canvas');
+  workCanvas.width=w; workCanvas.height=h;
+  workCanvas.getContext('2d').drawImage(bmp,0,0,w,h);
+}
+// 把工作位图同步到 <img> 显示。用 toBlob+objectURL 代替 toDataURL：
+// 大画布的 base64 dataURL 可能超长导致内存问题。
+let cropObjectUrl=null;
+function syncWorkToCrop(){
+  workCanvas.toBlob(blob=>{
+    if(!blob){
+      setStatus('图片处理失败（画布可能过大），请换一张图片','err');
+      rawFile=null;file=null;return;
+    }
+    if(cropObjectUrl)URL.revokeObjectURL(cropObjectUrl);
+    cropObjectUrl=URL.createObjectURL(blob);
+    cropImg.onload=()=>initCropView();
+    cropImg.onerror=()=>{
+      setStatus('图片处理失败，请换一张标准图片','err');
+      rawFile=null;file=null;
+    };
+    cropImg.src=cropObjectUrl;
+  },'image/jpeg',0.95);
+}
+function initCropView(){
+  cNW=workCanvas.width; cNH=workCanvas.height;
+  if(!cNW||!cNH){setStatus('图片解码失败：尺寸为 0，请换一张图','err');return;}
+  const r=cropView.getBoundingClientRect();
+  cVW=r.width; cVH=r.height;
+  cBase=Math.max(cVW/cNW, cVH/cNH);   // 最小缩放=铺满视口
+  applyCrop(1,(cVW-cNW*cBase)/2,(cVH-cNH*cBase)/2);  // 居中
+  cropper.classList.add('on');
+  setStatus('拖动框选构图，可旋转图片，确定后自动转标准 JPG','');
+}
+// 工作位图顺时针旋转 90°（宽高交换），然后重新铺满视口居中
+function rotateWork90(){
+  if(!workCanvas)return;
+  const src=workCanvas, w=src.width, h=src.height;
+  const dst=document.createElement('canvas');
+  dst.width=h; dst.height=w;
+  const ctx=dst.getContext('2d');
+  ctx.fillStyle='#ffffff'; ctx.fillRect(0,0,h,w);  // 透明区域铺白
+  ctx.translate(h,0); ctx.rotate(Math.PI/2);        // 顺时针 90°
+  ctx.drawImage(src,0,0);
+  workCanvas=dst;
+  syncWorkToCrop();
+}
+cropView.addEventListener('pointerdown',e=>{
+  cropView.setPointerCapture(e.pointerId);
+  pointers.set(e.pointerId,{x:e.clientX,y:e.clientY});
+  pinchD=0;
+});
+cropView.addEventListener('pointermove',e=>{
+  if(!pointers.has(e.pointerId))return;
+  const prev=pointers.get(e.pointerId);
+  pointers.set(e.pointerId,{x:e.clientX,y:e.clientY});
+  if(pointers.size===1){
+    // 单指/鼠标: 拖动平移
+    cX+=e.clientX-prev.x; cY+=e.clientY-prev.y; clampCrop();
+  }else if(pointers.size===2){
+    // 双指: 捏合缩放(以两指中点为锚点)
+    const [a,b]=[...pointers.values()];
+    const d=Math.hypot(a.x-b.x,a.y-b.y), mx=(a.x+b.x)/2, my=(a.y+b.y)/2;
+    if(pinchD>0){
+      const r=cropView.getBoundingClientRect();
+      zoomAt(cScale*d/pinchD, mx-r.left, my-r.top);
+    }
+    pinchD=d;
+  }
+});
+function ptrEnd(e){pointers.delete(e.pointerId);if(pointers.size<2)pinchD=0;}
+cropView.addEventListener('pointerup',ptrEnd);
+cropView.addEventListener('pointercancel',ptrEnd);
+cropZoom.addEventListener('input',()=>zoomAt(parseFloat(cropZoom.value),cVW/2,cVH/2));
+$('#cropReset').addEventListener('click',()=>applyCrop(1,(cVW-cNW*cBase)/2,(cVH-cNH*cBase)/2));
+$('#cropRotate').addEventListener('click',rotateWork90);
+$('#cropCancel').addEventListener('click',()=>{
+  file=null;rawFile=null;workCanvas=null;cropper.classList.remove('on');
+  if(cropObjectUrl){URL.revokeObjectURL(cropObjectUrl);cropObjectUrl=null;}
+  $('#file').value='';$('#preview').style.display='none';
+  $('#hint').textContent='点击选择，或把图片拖拽到这里（自动转 JPG）';
+  $('#btnUpload').disabled=true;setStatus('');
+});
+$('#cropOk').addEventListener('click',()=>{
+  // 视口 CSS 坐标 -> 工作位图自然像素坐标，绘制到 400x240 画布并导出 JPEG
+  const sDisp=cBase*cScale;
+  const sx=-cX/sDisp, sy=-cY/sDisp, sw=cVW/sDisp, sh=cVH/sDisp;
+  const cv=document.createElement('canvas');
+  cv.width=400; cv.height=240;
+  const ctx=cv.getContext('2d');
+  // 先铺白底: PNG/WebP 的透明区域导出 JPEG 时会变黑，先填白避免此问题
+  ctx.fillStyle='#ffffff'; ctx.fillRect(0,0,400,240);
+  ctx.drawImage(workCanvas, sx,sy,sw,sh, 0,0,400,240);
+  cv.toBlob(b=>{
+    const name=(rawFile.name||'photo').replace(/\.[^.]+$/,'')+'.jpg';
+    file=new File([b],name,{type:'image/jpeg'});
+    cropper.classList.remove('on');
+    showPreview();
+  },'image/jpeg',0.92);
+});
+window.addEventListener('resize',()=>{
+  if(!cropper.classList.contains('on'))return;
+  const r=cropView.getBoundingClientRect(); cVW=r.width; cVH=r.height;
+  cBase=Math.max(cVW/cNW,cVH/cNH); clampCrop();
+});
+
+
+$('#btnUpload').addEventListener('click',async()=>{
+  if(!gatt||!file||busy)return;
+  busy=true;$('#btnUpload').disabled=true;
+  $('#prog').style.display='block';$('#bar').style.width='0%';
+  try{
+    const bytes=new Uint8Array(await file.arrayBuffer());
+    // 1) 发送开始包: 'S' + uint32 LE 总长度
+    const start=new Uint8Array(5); start[0]=0x53;
+    new DataView(start.buffer).setUint32(1,bytes.length,true);
+    await writePkt(start);
+    // 2) 分包发送数据: 'D' + 数据
+    for(let off=0;off<bytes.length;off+=CHUNK){
+      const n=Math.min(CHUNK,bytes.length-off);
+      const pkt=new Uint8Array(n+1); pkt[0]=0x44;
+      pkt.set(bytes.subarray(off,off+n),1);
+      await writePkt(pkt);
+      $('#bar').style.width=Math.round((off+n)/bytes.length*100)+'%';
+    }
+    setStatus('已发送，设备正在解码显示…','');
+    // 3) 发送结束包 'F' 并等待结果通知
+    await writePkt(new Uint8Array([0x46]));
+    const resp=await waitDeviceMsg(30000);
+    if(resp.startsWith('OK')) setStatus('上传成功，已显示到屏幕','ok');
+    else setStatus('设备返回错误：'+resp,'err');
+  }catch(e){
+    setStatus('传输失败：'+e.message,'err');
+  }finally{
+    busy=false;$('#btnUpload').disabled=!gatt;
+  }
+});
+
+$('#btnClear').addEventListener('click',async()=>{
+  if(!gatt)return;
+  try{
+    await writePkt(new Uint8Array([0x43]));
+    setStatus('已发送清空指令','ok');
+  }catch(e){setStatus('操作失败：'+e.message,'err');}
+});
+</script>
+</body>
+</html>

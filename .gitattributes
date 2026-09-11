@@ -1,0 +1,14 @@
+# 仓库内统一使用 LF，检出到 Windows 时由 Git 自行转换
+* text=auto
+
+*.cpp text
+*.h   text
+*.ini text
+*.md  text
+*.html text
+*.js  text
+
+# 二进制/压缩产物不做换行转换
+*.min.js binary
+*.jpg binary
+*.png binary
