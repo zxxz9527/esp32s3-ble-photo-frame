@@ -345,7 +345,7 @@ $('#cropOk').addEventListener('click',()=>{
     file=new File([b],name,{type:'image/jpeg'});
     cropper.classList.remove('on');
     showPreview();
-  },'image/jpeg',0.92);
+  },'image/jpeg',0.98);
 });
 window.addEventListener('resize',()=>{
   if(!cropper.classList.contains('on'))return;

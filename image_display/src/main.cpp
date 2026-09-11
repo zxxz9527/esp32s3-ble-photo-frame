@@ -78,6 +78,16 @@
 #define PIN_P_CS  15    // 片选
 #define PIN_P_RST 16    // 复位
 #define PIN_P_BL  17    // 背光 (直接接 3.3V 常亮则改 -1)
+
+// ---- 按键 (低功耗切换) ----
+// 使用 GPIO1 (对地触发, 需外部上拉 10kΩ 或用 INPUT_PULLUP)。
+//   注: GPIO1 非 strapping/Flash/USB 引脚, 可自由使用。
+//   若想用板载 BOOT 键可改回 0 (GPIO0 是 strapping, 启动时不能被外部强下拉)。
+// 按一下: 启用蓝牙广播(可上传图片); 再按一下: 关闭蓝牙(省电)。
+// 启动时蓝牙默认关闭以降低功耗, 屏幕显示图片或提示。
+// 如改用其他 GPIO，确保避开 strapping(0/3/45/46)、Flash/PSRAM(26-37)、USB(19/20)。
+#define PIN_BTN       1
+#define BTN_DEBOUNCE_MS 50
 // ===================================================
 
 #define IMG_PATH        "/img.jpg"   // 持久保存的当前图片 (断电保留)
@@ -123,16 +133,7 @@ public:
     delay(15);
     wr(0x0400, 0x6200);            // NL=49 -> 400 行扫描
     wr(0x0008, 0x0808);            // 显示控制 2
-    wr(0x0300, 0x0C00);            // ---- Gamma 校正 ----
-    wr(0x0301, 0x5A0B);
-    wr(0x0302, 0x0906);
-    wr(0x0303, 0x1017);
-    wr(0x0304, 0x2300);
-    wr(0x0305, 0x1700);
-    wr(0x0306, 0x6309);
-    wr(0x0307, 0x0C09);
-    wr(0x0308, 0x100C);
-    wr(0x0309, 0x2232);
+    // 面板 Gamma 寄存器: 跳过, 色彩层次由软件 Gamma 校正处理(见下方 applyGamma)。
     wr(0x0010, 0x0016);            // 帧率 69.5Hz
     wr(0x0011, 0x0101);
     wr(0x0012, 0x0000);
@@ -397,18 +398,35 @@ static Display tft;
 // 重要: BLE 写回调运行在 Bluedroid 的 BTC_TASK 上，该任务栈很小(约3KB)，
 //       不能在回调里做 LittleFS 文件操作(会栈溢出重启)。
 //       因此回调只把数据 memcpy 进环形缓冲，写盘由 loop() 主循环完成。
-#define RING_SIZE (16 * 1024)
+#define RING_SIZE (64 * 1024)   // 64KB: 吸收主循环偶发卡顿, 防止回调阻塞
 static uint8_t  s_ring[RING_SIZE];
 static volatile uint32_t s_ringHead = 0;   // 回调(生产者)写入位置
 static volatile uint32_t s_ringTail = 0;   // loop(消费者)读取位置
 
 static BLECharacteristic* s_pTx = nullptr;
+static BLEServer*          s_pServer = nullptr;
 static volatile bool s_bleConnected  = false;
 static volatile bool s_sessionActive = false;  // 一次上传会话进行中
 static volatile bool s_startRequested = false;
 static volatile bool s_finishRequested = false;
 static volatile bool s_clearRequested  = false;
+static volatile bool s_overflow = false;   // 缓冲溢出标志(回调置位, loop 在 F 包检查)
 static volatile uint32_t s_startTotal = 0;
+
+// BLE 启用状态(由按键切换): false=关闭省电(不广播,无法连接), true=启用广播
+static volatile bool s_bleEnabled = false;
+// BLE 是否已初始化过(避免重复 init 导致内存泄漏)
+static bool s_bleInited = false;
+
+// 按键去抖状态(只在 loop 主任务访问)
+static uint32_t s_btnLastChange = 0;
+static bool     s_btnLastLevel  = true;   // HIGH=未按下
+static bool     s_btnEvent       = false;  // 检测到的"按下"事件(待 loop 处理)
+
+// Toast 弹窗: 显示 1 秒后自动消失, 恢复之前的显示
+static char     s_toastText[48] = {0};
+static uint16_t s_toastColor    = TFT_WHITE;
+static uint32_t s_toastExpire   = 0;     // 0 表示无 toast 在显示
 
 // 以下仅在 loop() 主循环中访问
 static File     s_upFile;
@@ -416,16 +434,25 @@ static bool     s_streamOpen = false;
 static uint32_t s_recvTotal = 0;
 static uint32_t s_recvBytes = 0;
 
-// 生产者: BLE 回调把数据放入环形缓冲 (满了就等 loop 消费，BLE 有每包ACK流控)
-static void ringPush(const uint8_t* data, uint32_t len) {
+// 生产者: BLE 回调把数据放入环形缓冲。
+// 重要: 回调运行在 BTC_TASK(栈~3KB)，绝对不能 busy-wait 等 loop 消费，
+//       否则 BLE 协议栈发不出 Write Response，网页端 writeValueWithResponse
+//       超时报 "GATT operation failed for unknown reason" 并断开。
+//       缓冲满时直接丢弃并置 s_overflow，由 loop 在 F 包时报错让用户重试。
+static bool ringPush(const uint8_t* data, uint32_t len) {
   uint32_t head = s_ringHead;
   for (uint32_t i = 0; i < len; i++) {
     uint32_t next = (head + 1 == RING_SIZE) ? 0 : head + 1;
-    while (next == s_ringTail) { /* 缓冲满，等待主循环写盘腾出空间 */ }
+    if (next == s_ringTail) {   // 缓冲满: 不阻塞, 丢弃并标记
+      s_overflow = true;
+      s_ringHead = head;
+      return false;
+    }
     s_ring[head] = data[i];
     head = next;
   }
   s_ringHead = head;
+  return true;
 }
 
 enum UiState { UI_BOOT, UI_CONNECTED, UI_RECEIVING, UI_IMAGE, UI_ERROR };
@@ -453,8 +480,15 @@ static void drawBoot() {
   tft.fillScreen(TFT_BLACK);
   centerText("ESP32-S3",      50,  &fonts::Font2, TFT_WHITE);
   centerText("Photo Display", 110, &fonts::Font0, TFT_CYAN);
-  centerText("BLE Ready",     160, &fonts::Font0, TFT_GREEN);
-  centerText(BLE_DEVICE_NAME, 200, &fonts::Font0, TFT_YELLOW);
+  if (s_bleEnabled) {
+    centerText("BLE Ready",     160, &fonts::Font0, TFT_GREEN);
+    centerText(BLE_DEVICE_NAME, 200, &fonts::Font0, TFT_YELLOW);
+  } else {
+    // 低功耗: 蓝牙已关闭, 提示用户按键启用
+    centerText("BLE OFF",       160, &fonts::Font0, TFT_RED);
+    centerText("press button",  195, &fonts::Font0, TFT_YELLOW);
+    centerText("to enable BLE", 215, &fonts::Font0, TFT_YELLOW);
+  }
 }
 
 static void drawConnected() {
@@ -487,20 +521,100 @@ static void drawDecodeError() {
   centerText("Use baseline JPG", 150, &fonts::Font0, TFT_YELLOW);
 }
 
-// 显示 LittleFS 中指定路径的 JPG：自动等比缩放 + 居中
+// 弹出 Toast 小窗口: 屏幕中央圆角矩形 + 一行文字, 1 秒后由 loop 清除。
+// 不主动 fillScreen (避免覆盖正在显示的图片), 只画窗口区域。
+static void drawToast(const char* msg, uint16_t fgColor) {
+  const int cw = 260, ch = 60;           // 窗口尺寸
+  const int cx = (tft.width() - cw) / 2;
+  const int cy = (tft.height() - ch) / 2;
+  // 半透明背景: 用深色填充模拟 (TFT 无 alpha, 用接近黑色的深蓝)
+  tft.fillRoundRect(cx, cy, cw, ch, 8, 0x1082);
+  // 边框
+  tft.drawRoundRect(cx, cy, cw, ch, 8, fgColor);
+  // 文字
+  tft.setTextDatum(middle_center);
+  tft.setTextColor(fgColor, 0x1082);
+  tft.setFont(&fonts::Font2);
+  tft.drawString(msg, tft.width() / 2, tft.height() / 2);
+}
+
+// ---- 软件 Gamma 校正 ----
+// 面板出厂模拟 Gamma 让高光区扁平(浅色和白色分不清)。
+// 在数字层面用查表法做 Gamma 1.5 校正: 让接近满值的浅色被压低,
+// 与白色拉开层次。例如肉色 G=54(565) → 校正后 ≈ 50, 白色 G=63 → 63 不变。
+// gamma > 1: 整体变暗但高光层次更丰富。值越大效果越强, 建议 1.3~2.0。
+static const float GAMMA_VAL = 1.5f;
+static uint8_t s_gammaR[32];   // 5-bit R/B 查表
+static uint8_t s_gammaG[64];   // 6-bit G 查表
+static bool s_gammaInited = false;
+
+static void initGammaTables() {
+  if (s_gammaInited) return;
+  for (int i = 0; i < 32; i++)
+    s_gammaR[i] = (uint8_t)roundf(powf((float)i / 31.0f, GAMMA_VAL) * 31.0f);
+  for (int i = 0; i < 64; i++)
+    s_gammaG[i] = (uint8_t)roundf(powf((float)i / 63.0f, GAMMA_VAL) * 63.0f);
+  s_gammaInited = true;
+}
+
+// 显示 LittleFS 中指定路径的 JPG：自动等比缩放 + 居中 + 软件 Gamma 校正
+// 用 PSRAM sprite 解码 JPEG, 查表校正每个 RGB565 像素后 pushSprite 到屏幕。
 static bool displayJpeg(const char* path) {
+  initGammaTables();
   tft.fillScreen(TFT_BLACK);
-  bool ok = tft.drawJpgFile(LittleFS, path,
-                            0, 0,
-                            tft.width(), tft.height(),  // 适配区域：整个屏幕
-                            0, 0,
-                            0.0f, 0.0f,                // 0 表示自动等比缩放(contain)
-                            middle_center);            // 居中
+
+  // 在 PSRAM 创建 sprite, 解码 JPEG 到 sprite (不在屏幕上)
+  lgfx::LGFX_Sprite sprite(&tft);
+  sprite.setColorDepth(16);
+  sprite.setPsram(true);
+  if (!sprite.createSprite(tft.width(), tft.height())) {
+    Serial.println("[ERR] PSRAM sprite alloc failed, fallback to direct draw");
+    // 回退: 直接画到屏幕(无 Gamma 校正)
+    bool ok = tft.drawJpgFile(LittleFS, path, 0, 0,
+                              tft.width(), tft.height(), 0, 0,
+                              0.0f, 0.0f, middle_center);
+    if (!ok) { drawDecodeError(); }
+    return ok;
+  }
+
+  // 解码 JPEG 到 sprite, 自动等比缩放居中
+  bool ok = sprite.drawJpgFile(LittleFS, path, 0, 0,
+                               tft.width(), tft.height(), 0, 0,
+                               0.0f, 0.0f, middle_center);
   if (!ok) {
     Serial.println("[ERR] JPEG decode failed");
+    sprite.deleteSprite();
     drawDecodeError();
+    return false;
   }
-  return ok;
+
+  // 遍历 sprite 像素做 Gamma 查表校正
+  // 重要: LovyanGFX sprite buffer 用大端序存 RGB565, ESP32 读 uint16_t 是小端序,
+  //       必须 bswap16 字节交换后再提取通道, 否则 R/G/B 错位(肉色变绿).
+  uint16_t* buf = (uint16_t*)sprite.getBuffer();
+  uint32_t total = (uint32_t)tft.width() * tft.height();
+  for (uint32_t i = 0; i < total; i++) {
+    uint16_t p = __builtin_bswap16(buf[i]);   // 大端 → 小端, 现在 bit layout 正确
+    uint8_t r5 = (p >> 11) & 0x1F;
+    uint8_t g6 = (p >>  5) & 0x3F;
+    uint8_t b5 =  p        & 0x1F;
+    uint16_t corrected = (uint16_t)((s_gammaR[r5] << 11) | (s_gammaG[g6] << 5) | s_gammaR[b5]);
+    buf[i] = __builtin_bswap16(corrected);   // 写回大端序, 与 LGFX 内部格式一致
+  }
+
+  // 推送到屏幕
+  sprite.pushSprite(0, 0);
+  sprite.deleteSprite();
+  return true;
+}
+
+// 显示一个 1 秒的 Toast 弹窗, 不破坏底层显示 (1 秒后由 loop 自动恢复)
+static void showToast(const char* msg, uint16_t fgColor) {
+  strncpy(s_toastText, msg, sizeof(s_toastText) - 1);
+  s_toastText[sizeof(s_toastText) - 1] = '\0';
+  s_toastColor = fgColor;
+  s_toastExpire = millis() + 1000;
+  drawToast(s_toastText, s_toastColor);
 }
 
 // ---------------- BLE 回调 ----------------
@@ -520,11 +634,13 @@ class PhotoServerCB : public BLEServerCallbacks {
     s_startRequested  = false;
     s_finishRequested = false;
     s_clearRequested  = false;
+    s_overflow = false;
     s_ringHead = 0;  // 丢弃环形缓冲中未写完的数据
     s_ringTail = 0;
-    BLEDevice::startAdvertising();
+    // 仅在 BLE 仍启用状态下恢复广播(用户按键关闭后不要重启广播)
+    if (s_bleEnabled) BLEDevice::startAdvertising();
     if (s_uiState != UI_IMAGE) {
-      s_uiState = UI_BOOT;
+      s_uiState = s_bleEnabled ? UI_BOOT : UI_IMAGE;
       s_uiDrawn = false;
     }
   }
@@ -547,12 +663,13 @@ class PhotoRxCB : public BLECharacteristicCallbacks {
         s_ringTail = 0;
         s_startTotal = total;
         s_finishRequested = false;
+        s_overflow = false;
         s_sessionActive = true;
         s_startRequested = true;   // loop 负责校验大小/打开文件
         break;
       }
       case 'D': {  // 数据: 'D' + 数据 -> 入环形缓冲
-        if (s_sessionActive && len > 1) {
+        if (s_sessionActive && len > 1 && !s_overflow) {
           ringPush(d + 1, (uint32_t)len - 1);
         }
         break;
@@ -585,16 +702,74 @@ static uint32_t pumpRingToFile() {
   return written;
 }
 
+// ---------------- BLE 启用/关闭 (由按键切换) ----------------
+// 启动蓝牙协议栈 + 创建 GATT 服务 + 开始广播。
+// 仅在 s_bleEnabled 为 false 时执行(避免重复初始化)。
+static void bleStart() {
+  if (s_bleEnabled) return;
+  if (!s_bleInited) {
+    BLEDevice::init(BLE_DEVICE_NAME);
+    BLEDevice::setMTU(512);
+    s_bleInited = true;
+  } else {
+    // 之前 deinit 过, 重新启动协议栈
+    BLEDevice::init(BLE_DEVICE_NAME);
+  }
+  s_pServer = BLEDevice::createServer();
+  s_pServer->setCallbacks(new PhotoServerCB());
+  BLEService* svc = s_pServer->createService(SVC_UUID);
+  s_pTx = svc->createCharacteristic(TX_UUID, BLECharacteristic::PROPERTY_NOTIFY);
+  s_pTx->addDescriptor(new BLE2902());
+  BLECharacteristic* pRx = svc->createCharacteristic(
+        RX_UUID, BLECharacteristic::PROPERTY_WRITE
+               | BLECharacteristic::PROPERTY_WRITE_NR);
+  pRx->setCallbacks(new PhotoRxCB());
+  svc->start();
+  BLEAdvertising* adv = BLEDevice::getAdvertising();
+  adv->addServiceUUID(SVC_UUID);
+  adv->setScanResponse(true);
+  adv->start();
+  s_bleEnabled = true;
+  Serial.printf("[BLE] enabled, advertising as \"%s\"\n", BLE_DEVICE_NAME);
+}
+
+// 关闭蓝牙: 停止广播 + 释放协议栈 + 清理传输状态。
+// deinit(false) 不释放内部缓冲内存, 下次 init() 复用, 避免反复分配。
+static void bleStop() {
+  if (!s_bleEnabled) return;
+  BLEDevice::stopAdvertising();
+  delay(30);                      // 等待协议栈稳定, 让 BTC 任务收尾
+  BLEDevice::deinit(false);       // 关闭 Bluedroid 协议栈(主要省电来源)
+  s_pServer = nullptr;
+  s_pTx = nullptr;
+  s_bleEnabled = false;
+  s_bleConnected = false;
+  s_sessionActive = false;
+  s_startRequested = false;
+  s_finishRequested = false;
+  s_clearRequested = false;
+  s_overflow = false;
+  s_ringHead = 0;
+  s_ringTail = 0;
+  if (s_streamOpen && s_upFile) { s_upFile.close(); s_streamOpen = false; }
+  Serial.println("[BLE] disabled (low power)");
+}
+
 // ---------------- setup / loop ----------------
 void setup() {
   Serial.begin(115200);
   delay(100);
   Serial.println("\n=== ESP32-S3 BLE Photo Display (PlatformIO) ===");
 
+  // 按键 (BOOT 按键, 对地触发, 内部上拉)
+  pinMode(PIN_BTN, INPUT_PULLUP);
+
   // 屏幕初始化
   tft.init();
   tft.setRotation(1);          // 横屏 400x240 (0/2 为竖屏)
-  tft.setBrightness(255);
+  // 背光: 满亮度(255)会让高光区视觉溢出, 浅色看起来发白。
+  //   降到 220 让色彩更饱和, 高光层次更明显。若仍偏淡可再降到 180。
+  tft.setBrightness(220);
   tft.fillScreen(TFT_BLACK);
 
   // 文件系统 (begin(true): 首次使用自动格式化)
@@ -612,31 +787,15 @@ void setup() {
     }
   }
 
-  // BLE 初始化
-  BLEDevice::init(BLE_DEVICE_NAME);
-  BLEDevice::setMTU(512);   // 协商更大 MTU，提高传图速度
-  BLEServer* srv = BLEDevice::createServer();
-  srv->setCallbacks(new PhotoServerCB());
+  // 低功耗: CPU 降到 80MHz (ESP32-S3 蓝牙最低稳定频率)
+  // 并口屏由 LCD_CAM 硬件外设驱动, 频率与 CPU 无关; JPEG 解码会稍慢但仅在传图结束瞬间
+  setCpuFrequencyMhz(80);
+  Serial.printf("[CPU] running at %u MHz\n", getCpuFrequencyMhz());
 
-  BLEService* svc = srv->createService(SVC_UUID);
-
-  s_pTx = svc->createCharacteristic(TX_UUID, BLECharacteristic::PROPERTY_NOTIFY);
-  s_pTx->addDescriptor(new BLE2902());
-
-  BLECharacteristic* pRx = svc->createCharacteristic(
-        RX_UUID, BLECharacteristic::PROPERTY_WRITE
-               | BLECharacteristic::PROPERTY_WRITE_NR);
-  pRx->setCallbacks(new PhotoRxCB());
-
-  svc->start();
-
-  BLEAdvertising* adv = BLEDevice::getAdvertising();
-  adv->addServiceUUID(SVC_UUID);
-  adv->setScanResponse(true);
-  adv->start();
-
-  Serial.printf("[BLE] advertising as \"%s\"\n", BLE_DEVICE_NAME);
+  // 蓝牙默认不启用 (按键按下后启用), 开机即省电
+  // 屏幕显示提示用户按 BOOT 键启用蓝牙
   if (s_uiState != UI_IMAGE) { s_uiState = UI_BOOT; s_uiDrawn = false; }
+  Serial.println("[BLE] disabled at boot, press BOOT to enable");
 }
 
 void loop() {
@@ -705,6 +864,13 @@ void loop() {
         if (s_recvBytes == 0) {
           LittleFS.remove(TMP_PATH);
           notifyStr("ERR:empty file");
+        } else if (s_overflow) {
+          // 缓冲曾溢出, 数据不完整, 丢弃并提示重试
+          LittleFS.remove(TMP_PATH);
+          s_uiState = s_bleConnected ? UI_ERROR : UI_BOOT;
+          s_uiDrawn = false;
+          Serial.println("[ERR] ring buffer overflow, data incomplete");
+          notifyStr("ERR:buffer overflow, please retry");
         } else {
           bool ok = displayJpeg(TMP_PATH);   // 解码在主任务做，不阻塞 BLE 栈
           if (ok) {
@@ -744,12 +910,56 @@ void loop() {
       uint8_t pct = s_recvTotal ? (uint8_t)(s_recvBytes * 100 / s_recvTotal) : 0;
       if (pct > 100) pct = 100;
       if (!s_uiDrawn) { drawReceiving(0); s_uiDrawn = true; s_pctDrawn = 0; }
-      if (pct != s_pctDrawn) { drawReceiving(pct); s_pctDrawn = pct; }
+      // 每 5% 才重绘一次, 避免频繁 fillRect 卡住主循环导致缓冲溢出
+      if (pct / 5 != s_pctDrawn / 5) { drawReceiving(pct); s_pctDrawn = pct; }
       break;
     }
     default:  // UI_IMAGE: 图片已在屏幕上，不做刷新
       break;
   }
 
-  delay(5);
+  // ---- 按键扫描 (GPIO1 键, 去抖) ----
+  bool curLevel = digitalRead(PIN_BTN);
+  if (curLevel != s_btnLastLevel) {
+    s_btnLastChange = millis();
+    s_btnLastLevel = curLevel;
+  }
+  if (!s_btnLastLevel && (millis() - s_btnLastChange > BTN_DEBOUNCE_MS)) {
+    if (!s_btnEvent) s_btnEvent = true;   // 已稳定按下, 置事件标志
+  }
+  // ---- 按键事件处理: 切换蓝牙 + 弹 Toast 提示 ----
+  if (s_btnEvent) {
+    s_btnEvent = false;
+    // 等待按键释放 (避免一次按下被多次触发; 超时 1s 自动放弃)
+    uint32_t t0 = millis();
+    while (!digitalRead(PIN_BTN) && (millis() - t0 < 1000)) { delay(5); }
+    if (s_bleEnabled) {
+      // 当前启用 -> 关闭 (省电)
+      bleStop();
+      showToast("BLE OFF", TFT_RED);
+    } else {
+      // 当前关闭 -> 启用 (可连接上传)
+      bleStart();
+      showToast("BLE ON",  TFT_GREEN);
+    }
+  }
+
+  // ---- Toast 过期处理: 1 秒后自动消失, 恢复底层显示 ----
+  if (s_toastExpire != 0 && millis() > s_toastExpire) {
+    s_toastExpire = 0;
+    // 重绘底层: 有图片重画图片, 无图片重画 BOOT 界面
+    if (LittleFS.exists(IMG_PATH) && (s_uiState == UI_IMAGE || s_uiState == UI_BOOT)) {
+      if (displayJpeg(IMG_PATH)) { s_uiState = UI_IMAGE; s_uiDrawn = true; }
+      else { s_uiState = UI_BOOT; s_uiDrawn = false; }
+    } else {
+      s_uiDrawn = false;   // 触发重绘 BOOT/Connected/Error 界面
+    }
+  }
+
+  // ---- 自适应延时: 传输期间快速响应, 空闲时降功耗 ----
+  if (s_streamOpen || s_startRequested || s_finishRequested || s_sessionActive) {
+    delay(1);   // 上传会话期间: 紧凑轮询, 防止环形缓冲溢出
+  } else {
+    delay(50);  // 空闲: 让 CPU 大量时间在 idle task, 降低功耗与温度
+  }
 }
